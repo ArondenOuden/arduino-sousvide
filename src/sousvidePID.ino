@@ -14,30 +14,28 @@ double OutputPercentage;
 
 unsigned long startMillis;
 unsigned long currentMillis;
-const unsigned long period = 5000;
+unsigned long elapsedMillis = 0;
 
-// Temperature threshold. Arduino light turns on when temp is within threshold 
-double lightThreshold = 0.5;
+const unsigned long serialPrintInterval = 5000;
+
+double tempApproveThreshold = 0.5; // Arduino light turns on when temp is within threshold of Setpoint
+double safetyTempMax = 90.0; // Maximum safe temperature 
+double lowerThreshold = -2.0; // Bang-bang lower threshold (offset from setpoint) 
+double upperThreshold = 1.5; // Bang-bang upper threshold (offset from setpoint)
 
 double kp = 2;
 double ki = 1;
 double kd = 3;
 
 //Specify the links and initial tuning parameters
-// PID pidController(&Input, &Output, &Setpoint, kp, ki, kd, DIRECT);
-PID pidController(&Input, &Output, &Setpoint, kp, ki, kd, P_ON_M, DIRECT);
+PID pidController(&Input, &Output, &Setpoint, kp, ki, kd, P_ON_E, DIRECT);
 movingAvgFloat tempMovingAvg(5);
 
 int WindowSize = 5000;
 unsigned long windowStartTime;
 
-// Temperature reading //
-// Data wire is plugged into digital pin 2 on the Arduino
-
-// Setup a oneWire instance to communicate with any OneWire device
-OneWire oneWire(ONE_WIRE_BUS);	
-
-// Pass oneWire reference to DallasTemperature library
+// Temperature reading
+OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
 void setup()
@@ -50,7 +48,6 @@ void setup()
 
     tempMovingAvg.begin();
 
-    //initialize the variables we're linked to
     Setpoint = 30;
 
     //tell the PID to range between 0 and the full window size
@@ -69,24 +66,55 @@ void loop()
     
     // Gets current temperature from sensor
     float currentTempReading = sensors.getTempCByIndex(0);
+
+    // Safety: Stop heating if the sensor is malfunctioning
+    if (currentTempReading == -127.0) {
+        digitalWrite(RelayPin, HIGH); // Turn off heating
+        Serial.println("Error: Temperature sensor failure!");
+        return;
+    }
+
+    // Safety: Stop heating if temperature exceeds maximum safety limit
+    if (currentTempReading > safetyTempMax) {
+        digitalWrite(RelayPin, HIGH); // Turn off heating
+        Serial.println("Error: Max temperature exceeded!");
+        return;
+    }
     
-    // add new current data point to the moving average and save the moving average as the new PID Input
+    // Add new current data point to the moving average
+    // And save the moving average as the new PID Input
     Input = tempMovingAvg.reading(currentTempReading);
 
-    // Compute PID values
-    pidController.Compute();
+    // Bang-bang or PID control
+    if (Input < (Setpoint + lowerThreshold)) {
+        digitalWrite(RelayPin, LOW); // Turn heating on
+        OutputPercentage = 100;
+    } else if (Input > (Setpoint + upperThreshold)) {
+        digitalWrite(RelayPin, HIGH); // Turn heating off
+        OutputPercentage = 0;
+    } else {
+        // PID control for fine-tuning within threshold
+        pidController.Compute();
+        unsigned long now = millis();
+        if (now - windowStartTime > WindowSize) {
+            windowStartTime += WindowSize;
+        }
+        if (Output > now - windowStartTime) digitalWrite(RelayPin, LOW);
+        else digitalWrite(RelayPin, HIGH);
+
+        // Calculate output as percentage of window size
+        OutputPercentage = (Output / WindowSize) * 100;
+    }
+
 
     // Turn light on Arduino on when temperature is within a threshold of the setpoint
     double tempDifference = fabs(Input - Setpoint);
-    if (tempDifference <= lightThreshold) {
+    if (tempDifference <= tempApproveThreshold) {
         digitalWrite(LED_BUILTIN, HIGH);
     }
     else {
         digitalWrite(LED_BUILTIN, LOW);
     }
-
-    // Calculate output as percentage of window size
-    OutputPercentage = (Output / WindowSize) * 100;
 
     // Serial.print("CurrentTemp:");
     // Serial.print(currentTempReading);
@@ -104,7 +132,7 @@ void loop()
     // Serial.println(OutputPercentage);
 
     currentMillis = millis();
-    if (currentMillis - startMillis >= period)
+    if (currentMillis - startMillis >= serialPrintInterval)
     {
         JsonDocument jsonOutput;
         jsonOutput["currentTemp"] = currentTempReading;
@@ -116,15 +144,4 @@ void loop()
         Serial.println("");
         startMillis = currentMillis;
     }
-
-    /************************************************
-     turn the output pin on/off based on pid output
-    ************************************************/
-    unsigned long now = millis();
-    if (now - windowStartTime > WindowSize)
-    { //time to shift the Relay Window
-        windowStartTime += WindowSize;
-    }
-    if (Output > now - windowStartTime) digitalWrite(RelayPin, LOW);
-    else digitalWrite(RelayPin, HIGH);
 }

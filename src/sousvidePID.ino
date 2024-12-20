@@ -8,9 +8,10 @@
 #define RelayPin 3
 #define ONE_WIRE_BUS 2
 
-//Define Variables we'll be connecting to
-double Setpoint, Input, Output;
-double OutputPercentage;
+double Setpoint, Input, Output; // PID class variables
+double OutputPercentage; // Status variables
+float currentTempReading;
+double tempDifference;
 
 unsigned long startMillis;
 unsigned long currentMillis;
@@ -31,8 +32,8 @@ double kd = 3;
 PID pidController(&Input, &Output, &Setpoint, kp, ki, kd, P_ON_E, DIRECT);
 movingAvgFloat tempMovingAvg(5);
 
-int WindowSize = 5000;
-unsigned long windowStartTime;
+int pidWindowSize = 5000;
+unsigned long pidWindowStartTime;
 
 // Temperature reading
 OneWire oneWire(ONE_WIRE_BUS);
@@ -44,43 +45,53 @@ void setup()
     pinMode(RelayPin, OUTPUT);
     pinMode(LED_BUILTIN, OUTPUT);
 
-    windowStartTime = millis();
+    pidWindowStartTime = millis();
 
     tempMovingAvg.begin();
 
+    // Initialize PID
     Setpoint = 30;
-
-    //tell the PID to range between 0 and the full window size
-    pidController.SetOutputLimits(0, WindowSize);
-
-    //turn the PID on
-    pidController.SetMode(AUTOMATIC);
+    pidController.SetOutputLimits(0, pidWindowSize);
+    pidController.SetMode(AUTOMATIC); // turn the PID on
 
     Serial.begin(9600);
 }
 
 void loop()
 {
+    readTemp();
+    if (!isSafe()) return;
+    temperatureControl();
+    tempApproveLight();
+    // sendSerialPlotterStatus():
+    sendJsonStatus();
+}
+
+void readTemp() {
     // Send the command to get temperatures
     sensors.requestTemperatures();
     
     // Gets current temperature from sensor
-    float currentTempReading = sensors.getTempCByIndex(0);
+    currentTempReading = sensors.getTempCByIndex(0);
+}
 
+bool isSafe() {
     // Safety: Stop heating if the sensor is malfunctioning
     if (currentTempReading == -127.0) {
         digitalWrite(RelayPin, HIGH); // Turn off heating
         Serial.println("Error: Temperature sensor failure!");
-        return;
+        return true;
     }
 
     // Safety: Stop heating if temperature exceeds maximum safety limit
     if (currentTempReading > safetyTempMax) {
         digitalWrite(RelayPin, HIGH); // Turn off heating
         Serial.println("Error: Max temperature exceeded!");
-        return;
+        return true;
     }
-    
+}
+
+void temperatureControl() {
     // Add new current data point to the moving average
     // And save the moving average as the new PID Input
     Input = tempMovingAvg.reading(currentTempReading);
@@ -95,51 +106,53 @@ void loop()
     } else {
         // PID control for fine-tuning within threshold
         pidController.Compute();
-        unsigned long now = millis();
-        if (now - windowStartTime > WindowSize) {
-            windowStartTime += WindowSize;
+        currentMillis = millis();
+        if (currentMillis - pidWindowStartTime > pidWindowSize) {
+            pidWindowStartTime += pidWindowSize;
         }
-        if (Output > now - windowStartTime) digitalWrite(RelayPin, LOW);
+        if (Output > currentMillis - pidWindowStartTime) digitalWrite(RelayPin, LOW);
         else digitalWrite(RelayPin, HIGH);
 
         // Calculate output as percentage of window size
-        OutputPercentage = (Output / WindowSize) * 100;
+        OutputPercentage = (Output / pidWindowSize) * 100;
     }
+}
 
-
+void tempApproveLight() {
     // Turn light on Arduino on when temperature is within a threshold of the setpoint
-    double tempDifference = fabs(Input - Setpoint);
-    if (tempDifference <= tempApproveThreshold) {
-        digitalWrite(LED_BUILTIN, HIGH);
-    }
-    else {
-        digitalWrite(LED_BUILTIN, LOW);
-    }
+    tempDifference = fabs(Input - Setpoint);
+    digitalWrite(LED_BUILTIN, (tempDifference <= tempApproveThreshold) ? HIGH : LOW);
+}
 
-    // Serial.print("CurrentTemp:");
-    // Serial.print(currentTempReading);
-    // Serial.print(",");
-    // Serial.print("Input (moving average):");
-    // Serial.print(Input);
-    // Serial.print(",");
-    // Serial.print("SetPoint:");
-    // Serial.print(Setpoint);
-    // Serial.print(",");
-    // Serial.print("TempDiff:");
-    // Serial.print(tempDifference);
-    // Serial.print(",");
-    // Serial.print("OutputPercentage:");
-    // Serial.println(OutputPercentage);
+void sendSerialPlotterStatus() {
+    Serial.print("CurrentTemp:");
+    Serial.print(currentTempReading);
+    Serial.print(",");
+    Serial.print("Input (moving average):");
+    Serial.print(Input);
+    Serial.print(",");
+    Serial.print("SetPoint:");
+    Serial.print(Setpoint);
+    Serial.print(",");
+    Serial.print("TempDiff:");
+    Serial.print(tempDifference);
+    Serial.print(",");
+    Serial.print("OutputPercentage:");
+    Serial.println(OutputPercentage);
+}
 
+void sendJsonStatus() {
     currentMillis = millis();
+    elapsedMillis = currentMillis - startMillis;
     if (currentMillis - startMillis >= serialPrintInterval)
     {
         JsonDocument jsonOutput;
-        jsonOutput["currentTemp"] = currentTempReading;
+        jsonOutput["currentTemp"] = currentTempReading; 
         jsonOutput["currentInputAvg"] = Input;
         jsonOutput["SetPoint"] = Setpoint;
         jsonOutput["tempDifference"] = tempDifference;
         jsonOutput["OutputPercentage"] = OutputPercentage;
+        jsonOutput["elapsedTime"] = elapsedMillis / (60000); // Time elapsed in minutes
         serializeJson(jsonOutput, Serial);
         Serial.println("");
         startMillis = currentMillis;
